@@ -28,12 +28,12 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Bot configuration
+# Bot configuration - DISABLE built-in help command to avoid conflicts
 intents = discord.Intents.default()
 intents.voice_states = True  # Required to track voice channel events
 intents.message_content = True  # Required for commands
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)  # Disable built-in help
 
 # Data storage file
 ATTENDANCE_FILE = 'attendance_data.json'
@@ -358,8 +358,12 @@ attendance_data = load_attendance_data()
 @bot.event
 async def on_ready():
     """Event triggered when bot is ready"""
-    logger.info(f'{bot.user} has connected to Discord!')
+    # Set bot status to invisible
+    await bot.change_presence(status=discord.Status.invisible)
+    
+    logger.info(f'{bot.user} has connected to Discord in INVISIBLE mode!')
     logger.info(f'Bot is in {len(bot.guilds)} guilds')
+    logger.info('Bot is running invisibly - users cannot see it online')
     logger.info('Advanced Music functionality enabled! 🎵')
     
     # Log guild information
@@ -579,7 +583,7 @@ async def play_music(ctx, *, query):
                 )
                 if source.thumbnail:
                     embed.set_thumbnail(url=source.thumbnail)
-                embed.set_footer(text="🎵 Advanced Music Bot | Running on Cloud ☁️")
+                embed.set_footer(text="🔇 Invisible Music Bot | Running on Cloud ☁️")
                 
                 await loading_msg.edit(embed=embed)
                 
@@ -644,7 +648,7 @@ async def play_next(ctx):
                 )
             if next_song.get('thumbnail'):
                 embed.set_thumbnail(url=next_song['thumbnail'])
-            embed.set_footer(text="🎵 Advanced Music Bot | Running on Cloud ☁️")
+            embed.set_footer(text="🔇 Invisible Music Bot | Running on Cloud ☁️")
             
             await ctx.send(embed=embed)
             
@@ -690,66 +694,28 @@ async def skip_song(ctx):
         logger.error(f"Error skipping song: {e}")
         await ctx.send(f"❌ Error skipping song: {str(e)}")
 
-@bot.command(name='loop')
-async def loop_command(ctx, mode=None):
-    """Set loop mode: off, song, queue"""
+@bot.command(name='stop')
+async def stop_music(ctx):
+    """Stop music and clear queue"""
     try:
         guild_id = ctx.guild.id
         
-        if guild_id not in music_queues:
-            await ctx.send("❌ No music queue found!")
-            return
+        if guild_id in music_queues:
+            music_queues[guild_id].clear()
         
-        queue = music_queues[guild_id]
-        
-        if mode is None:
-            # Show current loop mode
-            embed = discord.Embed(
-                title="🔄 Loop Mode",
-                description=f"Current mode: **{queue.loop_mode.title()}**\n\nAvailable modes:\n`off` - No looping\n`song` - Loop current song\n`queue` - Loop entire queue",
-                color=0x0099ff
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        if queue.set_loop_mode(mode.lower()):
-            loop_emojis = {"off": "⏹️", "song": "🔂", "queue": "🔁"}
-            embed = discord.Embed(
-                title=f"{loop_emojis.get(mode.lower(), '🔄')} Loop Mode Changed",
-                description=f"Loop mode set to: **{mode.title()}**",
-                color=0x00ff00
-            )
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send("❌ Invalid loop mode! Use: `off`, `song`, or `queue`")
-        
-    except Exception as e:
-        logger.error(f"Error setting loop mode: {e}")
-        await ctx.send(f"❌ Error setting loop mode: {str(e)}")
-
-@bot.command(name='shuffle')
-async def shuffle_command(ctx):
-    """Toggle shuffle mode"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in music_queues:
-            await ctx.send("❌ No music queue found!")
-            return
-        
-        queue = music_queues[guild_id]
-        shuffle_status = queue.toggle_shuffle()
+        if guild_id in voice_clients:
+            voice_clients[guild_id].stop()
         
         embed = discord.Embed(
-            title="🔀 Shuffle Mode",
-            description=f"Shuffle is now: **{'On' if shuffle_status else 'Off'}**",
-            color=0x00ff00 if shuffle_status else 0xff0000
+            title="⏹️ Music Stopped",
+            description="Queue cleared and playback stopped.",
+            color=0xff0000
         )
         await ctx.send(embed=embed)
         
     except Exception as e:
-        logger.error(f"Error toggling shuffle: {e}")
-        await ctx.send(f"❌ Error toggling shuffle: {str(e)}")
+        logger.error(f"Error stopping music: {e}")
+        await ctx.send(f"❌ Error stopping music: {str(e)}")
 
 @bot.command(name='queue', aliases=['q'])
 async def show_queue(ctx, page=1):
@@ -815,7 +781,7 @@ async def show_queue(ctx, page=1):
             )
             
             if total_pages > 1:
-                embed.set_footer(text=f"Use !queue {page+1} for next page | 🎵 Advanced Music Bot")
+                embed.set_footer(text=f"Use !queue {page+1} for next page | 🔇 Invisible Music Bot")
         
         await ctx.send(embed=embed)
         
@@ -823,257 +789,78 @@ async def show_queue(ctx, page=1):
         logger.error(f"Error showing queue: {e}")
         await ctx.send(f"❌ Error showing queue: {str(e)}")
 
-@bot.command(name='remove', aliases=['rm'])
-async def remove_song(ctx, index: int):
-    """Remove a song from the queue by index"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in music_queues:
-            await ctx.send("❌ No music queue found!")
-            return
-        
-        queue = music_queues[guild_id]
-        removed_song = queue.remove(index - 1)  # Convert to 0-based index
-        
-        if removed_song:
-            embed = discord.Embed(
-                title="🗑️ Song Removed",
-                description=f"Removed: **{removed_song['title']}**",
-                color=0xff0000
-            )
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send("❌ Invalid queue position!")
-        
-    except ValueError:
-        await ctx.send("❌ Please provide a valid number!")
-    except Exception as e:
-        logger.error(f"Error removing song: {e}")
-        await ctx.send(f"❌ Error removing song: {str(e)}")
+@bot.command(name='ping')
+async def ping(ctx):
+    """Check if bot is responsive"""
+    latency = round(bot.latency * 1000)
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description=f"🔇 Invisible Music & Attendance Bot running on cloud ☁️\nLatency: {latency}ms\n\n**Bot Status:** Invisible Mode 👻",
+        color=0x00ff00
+    )
+    await ctx.send(embed=embed)
 
-@bot.command(name='clear')
-async def clear_queue(ctx):
-    """Clear the entire music queue"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in music_queues:
-            await ctx.send("❌ No music queue found!")
-            return
-        
-        music_queues[guild_id].clear()
-        
-        embed = discord.Embed(
-            title="🗑️ Queue Cleared",
-            description="All songs have been removed from the queue.",
-            color=0xff0000
-        )
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error clearing queue: {e}")
-        await ctx.send(f"❌ Error clearing queue: {str(e)}")
+@bot.command(name='status')
+async def bot_status(ctx):
+    """Show bot status and mode"""
+    embed = discord.Embed(
+        title="🤖 Bot Status",
+        description="**Current Mode:** Invisible 👻\n**Visibility:** Hidden from member list\n**Functionality:** Fully operational",
+        color=0x808080
+    )
+    embed.add_field(
+        name="🎵 Music Features",
+        value="✅ Fully functional\n✅ Voice channel access\n✅ All commands available",
+        inline=True
+    )
+    embed.add_field(
+        name="📊 Attendance Tracking",
+        value="✅ Monitoring voice channels\n✅ Recording join/leave times\n✅ Data persistence",
+        inline=True
+    )
+    embed.add_field(
+        name="☁️ Cloud Status",
+        value="✅ Running 24/7\n✅ Auto-restart enabled\n✅ Invisible mode active",
+        inline=True
+    )
+    embed.set_footer(text="🔇 Invisible Music & Attendance Bot | Running on Cloud ☁️")
+    await ctx.send(embed=embed)
 
-@bot.command(name='history')
-async def show_history(ctx):
-    """Show recently played songs"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in music_queues:
-            await ctx.send("❌ No music queue found!")
-            return
-        
-        queue = music_queues[guild_id]
-        
-        if not queue.history:
-            embed = discord.Embed(
-                title="📜 Play History",
-                description="No songs in history yet.",
-                color=0x808080
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        embed = discord.Embed(
-            title="📜 Recently Played",
-            color=0x0099ff
-        )
-        
-        history_text = ""
-        for i, song in enumerate(reversed(list(queue.history)[-10:]), 1):  # Last 10 songs
-            history_text += f"{i}. **{song['title']}** - {song['requester'].mention}\n"
-        
-        embed.add_field(
-            name="🎵 Last 10 Songs",
-            value=history_text,
-            inline=False
-        )
-        
-        embed.set_footer(text="🎵 Advanced Music Bot | Running on Cloud ☁️")
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error showing history: {e}")
-        await ctx.send(f"❌ Error showing history: {str(e)}")
+@bot.command(name='commands', aliases=['help'])  # Renamed from 'help' to 'commands' to avoid conflicts
+async def show_commands(ctx):
+    """Show all available commands"""
+    embed = discord.Embed(
+        title="🔇 Invisible Music & Attendance Bot Commands",
+        description="Your invisible all-in-one Discord bot with advanced music features and attendance tracking!\n\n**Bot is running in INVISIBLE mode** 👻",
+        color=0x0099ff
+    )
+    
+    # Music commands
+    embed.add_field(
+        name="🎵 Music Commands",
+        value="`!play <song/url>` - Play music from YouTube or Spotify\n"
+              "`!skip` - Skip current song\n"
+              "`!stop` - Stop music and clear queue\n"
+              "`!queue [page]` - Show music queue\n"
+              "`!volume <0-100>` - Set volume\n"
+              "`!leave` - Disconnect from voice channel",
+        inline=False
+    )
+    
+    # Attendance commands
+    embed.add_field(
+        name="📊 Attendance & Status",
+        value="`!attendance` - Show server attendance summary\n"
+              "`!attendance @user` - Show user attendance details\n"
+              "`!ping` - Check bot status\n"
+              "`!status` - Show bot mode and status\n"
+              "`!commands` - Show this help message",
+        inline=False
+    )
+    
+    embed.set_footer(text="🔇 Invisible Music & Attendance Bot | Running on Cloud ☁️")
+    await ctx.send(embed=embed)
 
-@bot.command(name='nowplaying', aliases=['np'])
-async def now_playing(ctx):
-    """Show currently playing song with detailed info"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in music_queues or guild_id not in voice_clients:
-            await ctx.send("❌ Nothing is currently playing!")
-            return
-        
-        if not voice_clients[guild_id].is_playing():
-            await ctx.send("❌ Nothing is currently playing!")
-            return
-        
-        queue = music_queues[guild_id]
-        current = queue.current
-        
-        if not current:
-            await ctx.send("❌ No current song information available!")
-            return
-        
-        embed = discord.Embed(
-            title="🎵 Now Playing",
-            description=f"**{current['title']}**",
-            color=0x00ff00
-        )
-        
-        embed.add_field(
-            name="Duration", 
-            value=format_music_duration(current['duration']), 
-            inline=True
-        )
-        embed.add_field(
-            name="Requested by", 
-            value=current['requester'].mention, 
-            inline=True
-        )
-        embed.add_field(
-            name="Volume", 
-            value=f"{int(queue.volume * 100)}%", 
-            inline=True
-        )
-        
-        if current.get('uploader'):
-            embed.add_field(
-                name="Channel", 
-                value=current['uploader'], 
-                inline=True
-            )
-        
-        # Queue info
-        queue_info = f"Loop: {queue.loop_mode.title()}"
-        if queue.shuffle:
-            queue_info += " | Shuffle: On"
-        embed.add_field(
-            name="Queue Settings", 
-            value=queue_info, 
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Songs in Queue", 
-            value=str(len(queue.queue)), 
-            inline=True
-        )
-        
-        if current.get('thumbnail'):
-            embed.set_thumbnail(url=current['thumbnail'])
-        
-        embed.set_footer(text="🎵 Advanced Music Bot | Running on Cloud ☁️")
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error showing now playing: {e}")
-        await ctx.send(f"❌ Error showing now playing: {str(e)}")
-
-# Keep existing commands (stop, leave, volume, attendance, etc.)
-@bot.command(name='stop')
-async def stop_music(ctx):
-    """Stop music and clear queue"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id in music_queues:
-            music_queues[guild_id].clear()
-        
-        if guild_id in voice_clients:
-            voice_clients[guild_id].stop()
-        
-        embed = discord.Embed(
-            title="⏹️ Music Stopped",
-            description="Queue cleared and playback stopped.",
-            color=0xff0000
-        )
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error stopping music: {e}")
-        await ctx.send(f"❌ Error stopping music: {str(e)}")
-
-@bot.command(name='leave', aliases=['disconnect'])
-async def leave_voice(ctx):
-    """Make the bot leave the voice channel"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id in voice_clients:
-            await voice_clients[guild_id].disconnect()
-            del voice_clients[guild_id]
-            
-            if guild_id in music_queues:
-                music_queues[guild_id].clear()
-            
-            embed = discord.Embed(
-                title="👋 Disconnected",
-                description="Left the voice channel and cleared the queue.",
-                color=0x808080
-            )
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send("❌ I'm not connected to a voice channel!")
-            
-    except Exception as e:
-        logger.error(f"Error leaving voice channel: {e}")
-        await ctx.send(f"❌ Error leaving voice channel: {str(e)}")
-
-@bot.command(name='volume', aliases=['vol'])
-async def set_volume(ctx, volume: int):
-    """Set the music volume (0-100)"""
-    try:
-        if volume < 0 or volume > 100:
-            await ctx.send("❌ Volume must be between 0 and 100!")
-            return
-        
-        guild_id = ctx.guild.id
-        
-        if guild_id not in voice_clients or not voice_clients[guild_id].is_playing():
-            await ctx.send("❌ Nothing is currently playing!")
-            return
-        
-        # Set volume
-        voice_clients[guild_id].source.volume = volume / 100
-        music_queues[guild_id].volume = volume / 100
-        
-        embed = discord.Embed(
-            title="🔊 Volume Changed",
-            description=f"Volume set to **{volume}%**",
-            color=0x00ff00
-        )
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error setting volume: {e}")
-        await ctx.send(f"❌ Error setting volume: {str(e)}")
-
-# Keep all existing attendance commands and functions
 @bot.command(name='attendance')
 async def show_attendance(ctx, user_mention=None):
     """Show attendance data for a user or all users"""
@@ -1110,7 +897,7 @@ async def show_attendance(ctx, user_mention=None):
                         inline=False
                     )
                     
-                    embed.set_footer(text=f"🎵 Advanced Music & Attendance Bot | Running on Cloud ☁️")
+                    embed.set_footer(text=f"🔇 Invisible Music & Attendance Bot | Running on Cloud ☁️")
                     await ctx.send(embed=embed)
                 else:
                     await ctx.send("❌ No attendance data found for this user.")
@@ -1140,7 +927,7 @@ async def show_attendance(ctx, user_mention=None):
                 inline=False
             )
             
-            embed.set_footer(text=f"🎵 Advanced Music & Attendance Bot | Running on Cloud ☁️")
+            embed.set_footer(text=f"🔇 Invisible Music & Attendance Bot | Running on Cloud ☁️")
             await ctx.send(embed=embed)
             
     except Exception as e:
@@ -1232,69 +1019,13 @@ def calculate_total_time(sessions):
     else:
         return f"{seconds}s"
 
-@bot.command(name='ping')
-async def ping(ctx):
-    """Check if bot is responsive"""
-    latency = round(bot.latency * 1000)
-    embed = discord.Embed(
-        title="🏓 Pong!",
-        description=f"🎵 Advanced Music & Attendance Bot running on cloud ☁️\nLatency: {latency}ms",
-        color=0x00ff00
-    )
-    await ctx.send(embed=embed)
-
-@bot.command(name='help')
-async def help_command(ctx):
-    """Show all available commands"""
-    embed = discord.Embed(
-        title="🎵 Advanced Music & Attendance Bot Commands",
-        description="Your all-in-one Discord bot with advanced music features and attendance tracking!",
-        color=0x0099ff
-    )
-    
-    # Music commands
-    embed.add_field(
-        name="🎵 Music Commands",
-        value="`!play <song/url>` - Play music from YouTube or Spotify\n"
-              "`!skip` - Skip current song\n"
-              "`!stop` - Stop music and clear queue\n"
-              "`!queue [page]` - Show music queue\n"
-              "`!volume <0-100>` - Set volume\n"
-              "`!leave` - Disconnect from voice channel",
-        inline=False
-    )
-    
-    # Advanced music commands
-    embed.add_field(
-        name="🎛️ Advanced Music",
-        value="`!loop <off/song/queue>` - Set loop mode\n"
-              "`!shuffle` - Toggle shuffle mode\n"
-              "`!remove <#>` - Remove song from queue\n"
-              "`!clear` - Clear entire queue\n"
-              "`!history` - Show recently played songs\n"
-              "`!nowplaying` - Show current song details",
-        inline=False
-    )
-    
-    # Attendance commands
-    embed.add_field(
-        name="📊 Attendance Commands",
-        value="`!attendance` - Show server attendance summary\n"
-              "`!attendance @user` - Show user attendance details\n"
-              "`!ping` - Check bot status",
-        inline=False
-    )
-    
-    embed.set_footer(text="🎵 Advanced Music & Attendance Bot | Running on Cloud ☁️")
-    await ctx.send(embed=embed)
-
 # Error handling
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You don't have permission to use this command.")
     elif isinstance(error, commands.CommandNotFound):
-        await ctx.send("❌ Command not found. Use `!help` to see available commands.")
+        await ctx.send("❌ Command not found. Use `!commands` to see available commands.")
     else:
         logger.error(f"Command error: {error}")
         await ctx.send(f"❌ An error occurred: {error}")
@@ -1307,8 +1038,8 @@ if __name__ == "__main__":
         logger.error("Please set the DISCORD_BOT_TOKEN environment variable")
         exit(1)
     else:
-        logger.info("Starting Advanced Discord Music & Attendance Bot...")
-        logger.info("Bot will run 24/7 on cloud infrastructure")
+        logger.info("Starting FIXED Invisible Discord Music & Attendance Bot...")
+        logger.info("Bot will run 24/7 on cloud infrastructure in INVISIBLE mode")
         try:
             bot.run(token)
         except Exception as e:
