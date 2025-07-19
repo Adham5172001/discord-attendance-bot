@@ -8,13 +8,6 @@ from dotenv import load_dotenv
 import statistics
 import asyncio
 import re
-import aiohttp
-from collections import deque
-import yt_dlp
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-import random
-import ssl
 
 # Configure logging for cloud deployment
 logging.basicConfig(
@@ -39,217 +32,7 @@ bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)  # Di
 # Data storage file
 ATTENDANCE_FILE = 'attendance_data.json'
 
-# Enhanced Music configuration with SSL fixes for cloud deployment
-YTDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,  # Bypass SSL certificate verification
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'extractaudio': True,
-    'audioformat': 'mp3',
-    'audioquality': 192,
-    # Additional SSL and cloud-friendly options
-    'prefer_insecure': True,  # Use HTTP instead of HTTPS when possible
-    'no_check_certificate': True,  # Skip certificate verification
-    'socket_timeout': 30,  # Increase timeout for cloud environments
-    'retries': 3,  # Retry failed downloads
-    'fragment_retries': 3,  # Retry failed fragments
-    'skip_unavailable_fragments': True,  # Skip unavailable fragments
-    'keepvideo': False,  # Don't keep video files
-    'nopart': True,  # Don't use .part files
-}
-
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
-}
-
-# Initialize Spotify client (optional - requires API keys)
-spotify = None
-try:
-    spotify_client_id = os.getenv('SPOTIFY_CLIENT_ID')
-    spotify_client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
-    if spotify_client_id and spotify_client_secret:
-        spotify = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(
-            client_id=spotify_client_id,
-            client_secret=spotify_client_secret
-        ))
-        logger.info("Spotify integration enabled")
-    else:
-        logger.info("Spotify credentials not found - Spotify features disabled")
-except Exception as e:
-    logger.warning(f"Failed to initialize Spotify client: {e}")
-
-# Music queue and player management
-music_queues = {}
-voice_clients = {}
-
-class MusicSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.5):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get('title')
-        self.url = data.get('url')
-        self.duration = data.get('duration')
-        self.thumbnail = data.get('thumbnail')
-        self.uploader = data.get('uploader')
-
-    @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
-        loop = loop or asyncio.get_event_loop()
-        
-        # Create SSL context that doesn't verify certificates (for cloud environments)
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
-            try:
-                logger.info(f"Attempting to extract info from: {url}")
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-                
-                if 'entries' in data:
-                    # Take first item from a playlist
-                    data = data['entries'][0]
-                
-                filename = data['url'] if stream else ytdl.prepare_filename(data)
-                logger.info(f"Successfully extracted: {data.get('title', 'Unknown')}")
-                return cls(discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS), data=data)
-            except Exception as e:
-                logger.error(f"Error extracting audio from {url}: {e}")
-                # Try alternative extraction method
-                try:
-                    logger.info("Trying alternative extraction method...")
-                    # Use simpler options for problematic URLs
-                    simple_options = {
-                        'format': 'worst',
-                        'noplaylist': True,
-                        'nocheckcertificate': True,
-                        'no_warnings': True,
-                        'quiet': True,
-                        'prefer_insecure': True,
-                    }
-                    with yt_dlp.YoutubeDL(simple_options) as simple_ytdl:
-                        data = await loop.run_in_executor(None, lambda: simple_ytdl.extract_info(url, download=not stream))
-                        if 'entries' in data:
-                            data = data['entries'][0]
-                        filename = data['url'] if stream else simple_ytdl.prepare_filename(data)
-                        logger.info(f"Alternative method successful: {data.get('title', 'Unknown')}")
-                        return cls(discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS), data=data)
-                except Exception as e2:
-                    logger.error(f"Alternative method also failed: {e2}")
-                    raise Exception(f"Could not extract audio. This might be due to regional restrictions or the video being unavailable.")
-
-class AdvancedMusicQueue:
-    def __init__(self):
-        self.queue = deque()
-        self.history = deque(maxlen=50)  # Keep last 50 played songs
-        self.current = None
-        self.loop_mode = "off"  # off, song, queue
-        self.shuffle = False
-        self.volume = 0.5
-        self.autoplay = False
-        self.original_queue = deque()  # For shuffle mode
-
-    def add(self, song):
-        self.queue.append(song)
-        if self.shuffle and not self.original_queue:
-            self.original_queue = self.queue.copy()
-
-    def add_multiple(self, songs):
-        for song in songs:
-            self.add(song)
-
-    def next(self):
-        if self.loop_mode == "song" and self.current:
-            return self.current
-        
-        if self.current:
-            self.history.append(self.current)
-        
-        if self.loop_mode == "queue" and not self.queue and self.history:
-            # Restart queue from history
-            self.queue = deque(self.history)
-            self.history.clear()
-        
-        if self.queue:
-            if self.shuffle:
-                # Pick random song from queue
-                queue_list = list(self.queue)
-                random_song = random.choice(queue_list)
-                self.queue.remove(random_song)
-                self.current = random_song
-            else:
-                self.current = self.queue.popleft()
-            return self.current
-        return None
-
-    def skip(self):
-        if self.queue:
-            if self.shuffle:
-                queue_list = list(self.queue)
-                random_song = random.choice(queue_list)
-                self.queue.remove(random_song)
-                self.current = random_song
-            else:
-                self.current = self.queue.popleft()
-            return self.current
-        return None
-
-    def clear(self):
-        self.queue.clear()
-        self.history.clear()
-        self.original_queue.clear()
-        self.current = None
-
-    def remove(self, index):
-        if 0 <= index < len(self.queue):
-            queue_list = list(self.queue)
-            removed = queue_list.pop(index)
-            self.queue = deque(queue_list)
-            return removed
-        return None
-
-    def move(self, from_index, to_index):
-        if 0 <= from_index < len(self.queue) and 0 <= to_index < len(self.queue):
-            queue_list = list(self.queue)
-            song = queue_list.pop(from_index)
-            queue_list.insert(to_index, song)
-            self.queue = deque(queue_list)
-            return True
-        return False
-
-    def toggle_shuffle(self):
-        self.shuffle = not self.shuffle
-        if self.shuffle:
-            # Store original order
-            self.original_queue = self.queue.copy()
-            # Shuffle current queue
-            queue_list = list(self.queue)
-            random.shuffle(queue_list)
-            self.queue = deque(queue_list)
-        else:
-            # Restore original order if available
-            if self.original_queue:
-                self.queue = self.original_queue.copy()
-                self.original_queue.clear()
-        return self.shuffle
-
-    def set_loop_mode(self, mode):
-        valid_modes = ["off", "song", "queue"]
-        if mode in valid_modes:
-            self.loop_mode = mode
-            return True
-        return False
-
-# Attendance tracking functions (keeping existing functionality)
+# Attendance tracking functions
 def load_attendance_data():
     """Load attendance data from JSON file"""
     try:
@@ -302,94 +85,6 @@ def format_duration(duration_str):
     except:
         return duration_str
 
-def format_music_duration(seconds):
-    """Format music duration in seconds to readable format"""
-    if not seconds:
-        return "Unknown"
-    
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    seconds = int(seconds % 60)
-    
-    if hours > 0:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    else:
-        return f"{minutes}:{seconds:02d}"
-
-async def get_spotify_track_info(url):
-    """Extract track info from Spotify URL"""
-    if not spotify:
-        return None
-    
-    try:
-        # Extract track ID from Spotify URL
-        track_id = re.search(r'track/([a-zA-Z0-9]+)', url)
-        if not track_id:
-            return None
-        
-        track = spotify.track(track_id.group(1))
-        
-        # Create search query for YouTube
-        search_query = f"{track['artists'][0]['name']} {track['name']}"
-        
-        return {
-            'title': track['name'],
-            'artist': track['artists'][0]['name'],
-            'search_query': search_query,
-            'duration': track['duration_ms'] // 1000,
-            'thumbnail': track['album']['images'][0]['url'] if track['album']['images'] else None,
-            'spotify_url': url
-        }
-    except Exception as e:
-        logger.error(f"Error getting Spotify track info: {e}")
-        return None
-
-async def get_spotify_playlist_info(url):
-    """Extract playlist info from Spotify URL"""
-    if not spotify:
-        return None
-    
-    try:
-        # Extract playlist ID from Spotify URL
-        playlist_id = re.search(r'playlist/([a-zA-Z0-9]+)', url)
-        if not playlist_id:
-            return None
-        
-        playlist = spotify.playlist(playlist_id.group(1))
-        tracks = []
-        
-        for item in playlist['tracks']['items'][:50]:  # Limit to 50 tracks
-            if item['track']:
-                track = item['track']
-                search_query = f"{track['artists'][0]['name']} {track['name']}"
-                tracks.append({
-                    'title': track['name'],
-                    'artist': track['artists'][0]['name'],
-                    'search_query': search_query,
-                    'duration': track['duration_ms'] // 1000,
-                    'spotify_url': track['external_urls']['spotify']
-                })
-        
-        return {
-            'name': playlist['name'],
-            'tracks': tracks,
-            'total_tracks': len(tracks)
-        }
-    except Exception as e:
-        logger.error(f"Error getting Spotify playlist info: {e}")
-        return None
-
-def is_url(string):
-    """Check if string is a URL"""
-    url_pattern = re.compile(
-        r'^https?://'  # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain...
-        r'localhost|'  # localhost...
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
-        r'(?::\d+)?'  # optional port
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    return url_pattern.match(string) is not None
-
 # Global attendance data
 attendance_data = load_attendance_data()
 
@@ -402,14 +97,12 @@ async def on_ready():
     logger.info(f'{bot.user} has connected to Discord in INVISIBLE mode!')
     logger.info(f'Bot is in {len(bot.guilds)} guilds')
     logger.info('Bot is running invisibly - users cannot see it online')
-    logger.info('SSL-Fixed Music functionality enabled! 🎵')
+    logger.info('🎵 Music functionality temporarily disabled due to cloud restrictions')
+    logger.info('📊 Attendance tracking fully operational!')
     
     # Log guild information
     for guild in bot.guilds:
         logger.info(f'Connected to guild: {guild.name} (ID: {guild.id})')
-        # Initialize music queue for each guild
-        if guild.id not in music_queues:
-            music_queues[guild.id] = AdvancedMusicQueue()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -488,371 +181,99 @@ async def on_voice_state_update(member, before, after):
     except Exception as e:
         logger.error(f"Error in voice state update: {e}")
 
-# Enhanced Music Commands with better error handling
+# Music Commands (Simplified for cloud compatibility)
 @bot.command(name='play', aliases=['p'])
 async def play_music(ctx, *, query):
-    """Play music from YouTube or Spotify with enhanced cloud compatibility"""
-    try:
-        # Check if user is in a voice channel
-        if not ctx.author.voice:
-            await ctx.send("❌ You need to be in a voice channel to play music!")
-            return
-        
-        channel = ctx.author.voice.channel
-        guild_id = ctx.guild.id
-        
-        # Initialize music queue if not exists
-        if guild_id not in music_queues:
-            music_queues[guild_id] = AdvancedMusicQueue()
-        
-        # Connect to voice channel if not already connected
-        if guild_id not in voice_clients or not voice_clients[guild_id].is_connected():
-            voice_clients[guild_id] = await channel.connect()
-            logger.info(f"Connected to voice channel: {channel.name}")
-        
-        # Handle Spotify playlists
-        if 'spotify.com/playlist' in query:
-            playlist_info = await get_spotify_playlist_info(query)
-            if playlist_info:
-                embed = discord.Embed(
-                    title="🎵 Adding Spotify Playlist",
-                    description=f"**{playlist_info['name']}**\nAdding {playlist_info['total_tracks']} tracks to queue...",
-                    color=0x1DB954
-                )
-                loading_msg = await ctx.send(embed=embed)
-                
-                added_count = 0
-                for track in playlist_info['tracks']:
-                    try:
-                        search_query = f"ytsearch:{track['search_query']}"
-                        source = await MusicSource.from_url(search_query, loop=bot.loop, stream=True)
-                        
-                        music_queues[guild_id].add({
-                            'source': source,
-                            'title': source.title,
-                            'url': source.url,
-                            'duration': source.duration,
-                            'thumbnail': source.thumbnail,
-                            'uploader': source.uploader,
-                            'requester': ctx.author
-                        })
-                        added_count += 1
-                    except:
-                        continue
-                
-                embed = discord.Embed(
-                    title="✅ Playlist Added",
-                    description=f"**{playlist_info['name']}**\nAdded {added_count} tracks to queue!",
-                    color=0x00ff00
-                )
-                await loading_msg.edit(embed=embed)
-                
-                # Start playing if nothing is playing
-                if not voice_clients[guild_id].is_playing():
-                    await play_next(ctx)
-                return
-        
-        # Handle Spotify tracks
-        elif 'spotify.com/track' in query:
-            spotify_info = await get_spotify_track_info(query)
-            if spotify_info:
-                query = spotify_info['search_query']
-                embed = discord.Embed(
-                    title="🎵 Processing Spotify Track",
-                    description=f"Searching for: **{spotify_info['title']}** by **{spotify_info['artist']}**",
-                    color=0x1DB954
-                )
-                await ctx.send(embed=embed)
-            else:
-                await ctx.send("❌ Could not process Spotify link. Please try a YouTube link or search query.")
-                return
-        
-        # Add "ytsearch:" prefix if it's not a URL
-        if not is_url(query):
-            query = f"ytsearch:{query}"
-        
-        # Create loading message
-        loading_embed = discord.Embed(
-            title="🔍 Searching...",
-            description=f"Looking for: **{query.replace('ytsearch:', '')}**",
-            color=0xffff00
-        )
-        loading_msg = await ctx.send(embed=loading_embed)
-        
-        try:
-            # Get music source with enhanced error handling
-            source = await MusicSource.from_url(query, loop=bot.loop, stream=True)
-            
-            # Add to queue
-            music_queues[guild_id].add({
-                'source': source,
-                'title': source.title,
-                'url': source.url,
-                'duration': source.duration,
-                'thumbnail': source.thumbnail,
-                'uploader': source.uploader,
-                'requester': ctx.author
-            })
-            
-            # If nothing is playing, start playing
-            if not voice_clients[guild_id].is_playing():
-                await play_next(ctx)
-            else:
-                # Song added to queue
-                embed = discord.Embed(
-                    title="➕ Added to Queue",
-                    description=f"**{source.title}**",
-                    color=0x00ff00
-                )
-                embed.add_field(
-                    name="Duration", 
-                    value=format_music_duration(source.duration), 
-                    inline=True
-                )
-                embed.add_field(
-                    name="Position in Queue", 
-                    value=f"{len(music_queues[guild_id].queue)}", 
-                    inline=True
-                )
-                embed.add_field(
-                    name="Requested by", 
-                    value=ctx.author.mention, 
-                    inline=True
-                )
-                if source.thumbnail:
-                    embed.set_thumbnail(url=source.thumbnail)
-                embed.set_footer(text="🔇 Invisible Music Bot | SSL-Fixed Cloud Version ☁️")
-                
-                await loading_msg.edit(embed=embed)
-                
-        except Exception as e:
-            logger.error(f"Error playing music: {e}")
-            error_embed = discord.Embed(
-                title="❌ Music Error",
-                description=f"Could not play the requested song.\n\n**Possible reasons:**\n• Video is region-blocked\n• Video is age-restricted\n• Video is unavailable\n• Network connectivity issues\n\n**Try:**\n• A different song\n• A direct YouTube link\n• Searching with different keywords",
-                color=0xff0000
-            )
-            error_embed.set_footer(text="🔇 Invisible Music Bot | SSL-Fixed Cloud Version ☁️")
-            await loading_msg.edit(embed=error_embed)
-            
-    except Exception as e:
-        logger.error(f"Error in play command: {e}")
-        await ctx.send(f"❌ An error occurred: {str(e)}")
+    """Explain music limitations on free cloud hosting"""
+    embed = discord.Embed(
+        title="🎵 Music Feature Status",
+        description="**Music functionality is currently limited on free cloud hosting platforms.**",
+        color=0xffaa00
+    )
+    
+    embed.add_field(
+        name="🚫 Current Limitations",
+        value="• Free cloud platforms block YouTube downloading\n"
+              "• Network restrictions prevent audio streaming\n"
+              "• Voice channel connections are unstable\n"
+              "• SSL/TLS policies block media access",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="✅ What's Working",
+        value="• Voice channel detection\n"
+              "• Command processing\n"
+              "• Attendance tracking\n"
+              "• All other bot features",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔧 Solutions",
+        value="**For Full Music Functionality:**\n"
+              "• Use a paid cloud service (Heroku, DigitalOcean)\n"
+              "• Run bot on your local machine\n"
+              "• Use a VPS with fewer restrictions\n\n"
+              "**Current Focus:**\n"
+              "• Attendance tracking works perfectly ✅\n"
+              "• All other features operational ✅",
+        inline=False
+    )
+    
+    embed.set_footer(text="🔇 Invisible Attendance Bot | Cloud-Optimized ☁️")
+    await ctx.send(embed=embed)
 
-async def play_next(ctx):
-    """Play the next song in queue"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in music_queues or guild_id not in voice_clients:
-            return
-        
-        queue = music_queues[guild_id]
-        voice_client = voice_clients[guild_id]
-        
-        next_song = queue.next()
-        if next_song:
-            # Create now playing embed
-            embed = discord.Embed(
-                title="🎵 Now Playing",
-                description=f"**{next_song['title']}**",
-                color=0x00ff00
-            )
-            embed.add_field(
-                name="Duration", 
-                value=format_music_duration(next_song['duration']), 
-                inline=True
-            )
-            embed.add_field(
-                name="Requested by", 
-                value=next_song['requester'].mention, 
-                inline=True
-            )
-            
-            # Add queue info
-            queue_info = f"Loop: {queue.loop_mode.title()}"
-            if queue.shuffle:
-                queue_info += " | Shuffle: On"
-            embed.add_field(
-                name="Queue Info", 
-                value=queue_info, 
-                inline=True
-            )
-            
-            if next_song.get('uploader'):
-                embed.add_field(
-                    name="Channel", 
-                    value=next_song['uploader'], 
-                    inline=True
-                )
-            if next_song.get('thumbnail'):
-                embed.set_thumbnail(url=next_song['thumbnail'])
-            embed.set_footer(text="🔇 Invisible Music Bot | SSL-Fixed Cloud Version ☁️")
-            
-            await ctx.send(embed=embed)
-            
-            # Play the song
-            voice_client.play(
-                next_song['source'], 
-                after=lambda e: asyncio.run_coroutine_threadsafe(
-                    play_next(ctx), bot.loop
-                ) if not e else logger.error(f"Player error: {e}")
-            )
-        else:
-            # Queue is empty
-            embed = discord.Embed(
-                title="🔇 Queue Empty",
-                description="No more songs in queue. Add more songs with `!play <song>`",
-                color=0x808080
-            )
-            await ctx.send(embed=embed)
-            
-    except Exception as e:
-        logger.error(f"Error playing next song: {e}")
-
-@bot.command(name='skip', aliases=['s'])
-async def skip_song(ctx):
-    """Skip the current song"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in voice_clients or not voice_clients[guild_id].is_playing():
-            await ctx.send("❌ Nothing is currently playing!")
-            return
-        
-        voice_clients[guild_id].stop()
-        
-        embed = discord.Embed(
-            title="⏭️ Song Skipped",
-            description="Playing next song in queue...",
-            color=0x00ff00
-        )
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error skipping song: {e}")
-        await ctx.send(f"❌ Error skipping song: {str(e)}")
-
-@bot.command(name='stop')
-async def stop_music(ctx):
-    """Stop music and clear queue"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id in music_queues:
-            music_queues[guild_id].clear()
-        
-        if guild_id in voice_clients:
-            voice_clients[guild_id].stop()
-        
-        embed = discord.Embed(
-            title="⏹️ Music Stopped",
-            description="Queue cleared and playback stopped.",
-            color=0xff0000
-        )
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error stopping music: {e}")
-        await ctx.send(f"❌ Error stopping music: {str(e)}")
-
-@bot.command(name='leave', aliases=['disconnect'])
-async def leave_voice(ctx):
-    """Disconnect from voice channel"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id in voice_clients:
-            await voice_clients[guild_id].disconnect()
-            del voice_clients[guild_id]
-            
-            if guild_id in music_queues:
-                music_queues[guild_id].clear()
-            
-            embed = discord.Embed(
-                title="👋 Disconnected",
-                description="Left voice channel and cleared queue.",
-                color=0x808080
-            )
-            await ctx.send(embed=embed)
-        else:
-            await ctx.send("❌ Not connected to a voice channel!")
-        
-    except Exception as e:
-        logger.error(f"Error leaving voice channel: {e}")
-        await ctx.send(f"❌ Error leaving voice channel: {str(e)}")
-
-@bot.command(name='queue', aliases=['q'])
-async def show_queue(ctx, page=1):
-    """Show the current music queue"""
-    try:
-        guild_id = ctx.guild.id
-        
-        if guild_id not in music_queues:
-            await ctx.send("❌ No music queue found!")
-            return
-        
-        queue = music_queues[guild_id]
-        
-        if not queue.queue and not queue.current:
-            embed = discord.Embed(
-                title="📝 Music Queue",
-                description="Queue is empty. Add songs with `!play <song>`",
-                color=0x808080
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        embed = discord.Embed(
-            title="📝 Music Queue",
-            color=0x0099ff
-        )
-        
-        # Show currently playing
-        if queue.current:
-            embed.add_field(
-                name="🎵 Now Playing",
-                value=f"**{queue.current['title']}**\nRequested by: {queue.current['requester'].mention}",
-                inline=False
-            )
-        
-        # Show queue settings
-        settings = f"Loop: {queue.loop_mode.title()}"
-        if queue.shuffle:
-            settings += " | Shuffle: On"
-        embed.add_field(
-            name="⚙️ Settings",
-            value=settings,
-            inline=False
-        )
-        
-        # Show queue with pagination
-        if queue.queue:
-            songs_per_page = 10
-            total_pages = (len(queue.queue) - 1) // songs_per_page + 1
-            page = max(1, min(page, total_pages))
-            
-            start_idx = (page - 1) * songs_per_page
-            end_idx = start_idx + songs_per_page
-            
-            queue_text = ""
-            for i, song in enumerate(list(queue.queue)[start_idx:end_idx], start_idx + 1):
-                queue_text += f"{i}. **{song['title']}** - {song['requester'].mention}\n"
-            
-            embed.add_field(
-                name=f"⏭️ Up Next (Page {page}/{total_pages})",
-                value=queue_text,
-                inline=False
-            )
-            
-            if total_pages > 1:
-                embed.set_footer(text=f"Use !queue {page+1} for next page | 🔇 SSL-Fixed Invisible Music Bot")
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error showing queue: {e}")
-        await ctx.send(f"❌ Error showing queue: {str(e)}")
+@bot.command(name='music_info')
+async def music_info(ctx):
+    """Detailed explanation of music limitations"""
+    embed = discord.Embed(
+        title="🎵 Music Bot Limitations on Free Cloud Hosting",
+        description="Here's why music bots struggle on free cloud platforms:",
+        color=0x0099ff
+    )
+    
+    embed.add_field(
+        name="🌐 Network Restrictions",
+        value="• Railway/Render block YouTube API access\n"
+              "• SSL certificate policies prevent downloads\n"
+              "• Bandwidth limitations for audio streaming\n"
+              "• Firewall rules block media connections",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💰 Why Premium Hosting Works",
+        value="• Dedicated IP addresses\n"
+              "• Relaxed network policies\n"
+              "• Higher bandwidth allowances\n"
+              "• Custom SSL configurations\n"
+              "• VPN/proxy capabilities",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🏠 Local Hosting Benefits",
+        value="• No network restrictions\n"
+              "• Direct YouTube access\n"
+              "• Full control over connections\n"
+              "• Unlimited bandwidth\n"
+              "• Custom configurations",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 What Works Perfectly",
+        value="• **Attendance Tracking** - 100% functional ✅\n"
+              "• **Voice Channel Monitoring** - Real-time ✅\n"
+              "• **Data Analytics** - Complete stats ✅\n"
+              "• **User Management** - Full features ✅\n"
+              "• **Cloud Operation** - 24/7 uptime ✅",
+        inline=False
+    )
+    
+    embed.set_footer(text="🔇 Invisible Attendance Bot | Specialized for Voice Tracking ☁️")
+    await ctx.send(embed=embed)
 
 @bot.command(name='ping')
 async def ping(ctx):
@@ -860,69 +281,99 @@ async def ping(ctx):
     latency = round(bot.latency * 1000)
     embed = discord.Embed(
         title="🏓 Pong!",
-        description=f"🔇 SSL-Fixed Invisible Music & Attendance Bot running on cloud ☁️\nLatency: {latency}ms\n\n**Bot Status:** Invisible Mode 👻\n**Music Status:** SSL-Fixed & Cloud-Optimized ✅",
+        description=f"🔇 **Invisible Attendance Bot** running on cloud ☁️\n\n"
+                   f"**Latency:** {latency}ms\n"
+                   f"**Status:** Invisible Mode 👻\n"
+                   f"**Attendance Tracking:** ✅ Fully Operational\n"
+                   f"**Music:** ⚠️ Limited by cloud restrictions",
         color=0x00ff00
     )
+    embed.set_footer(text="🔇 Specialized for Voice Channel Attendance Tracking")
     await ctx.send(embed=embed)
 
 @bot.command(name='status')
 async def bot_status(ctx):
-    """Show bot status and mode"""
+    """Show bot status and capabilities"""
     embed = discord.Embed(
-        title="🤖 Bot Status",
-        description="**Current Mode:** Invisible 👻\n**Visibility:** Hidden from member list\n**Functionality:** Fully operational\n**Music System:** SSL-Fixed for cloud ✅",
+        title="🤖 Bot Status & Capabilities",
+        description="**Current Mode:** Invisible 👻\n**Primary Function:** Voice Channel Attendance Tracking",
         color=0x808080
     )
+    
     embed.add_field(
-        name="🎵 Music Features",
-        value="✅ SSL certificate bypass enabled\n✅ Cloud-optimized downloading\n✅ Enhanced error handling\n✅ Voice channel access",
-        inline=True
+        name="✅ Fully Operational Features",
+        value="• **Voice Channel Monitoring** - Real-time tracking\n"
+              "• **Attendance Analytics** - Detailed statistics\n"
+              "• **User Session Tracking** - Join/leave times\n"
+              "• **Data Persistence** - Cloud storage\n"
+              "• **Invisible Operation** - Hidden from users\n"
+              "• **24/7 Cloud Hosting** - Always online",
+        inline=False
     )
+    
     embed.add_field(
-        name="📊 Attendance Tracking",
-        value="✅ Monitoring voice channels\n✅ Recording join/leave times\n✅ Data persistence",
-        inline=True
+        name="⚠️ Limited Features",
+        value="• **Music Playback** - Restricted by cloud platform\n"
+              "• **Audio Streaming** - Network limitations\n"
+              "• **YouTube Downloads** - Blocked by hosting provider",
+        inline=False
     )
+    
     embed.add_field(
-        name="☁️ Cloud Status",
-        value="✅ Running 24/7\n✅ Auto-restart enabled\n✅ Invisible mode active\n✅ SSL issues resolved",
-        inline=True
+        name="🎯 Specialized Capabilities",
+        value="• **Professional Attendance System** 📊\n"
+              "• **Advanced Analytics** 📈\n"
+              "• **User Behavior Tracking** 👥\n"
+              "• **Session Management** ⏱️\n"
+              "• **Data Export** 📁",
+        inline=False
     )
-    embed.set_footer(text="🔇 SSL-Fixed Invisible Music & Attendance Bot | Running on Cloud ☁️")
+    
+    embed.set_footer(text="🔇 Invisible Attendance Bot | Cloud-Optimized for Voice Tracking ☁️")
     await ctx.send(embed=embed)
 
-@bot.command(name='commands', aliases=['help'])  # Renamed from 'help' to 'commands' to avoid conflicts
+@bot.command(name='commands', aliases=['help'])
 async def show_commands(ctx):
     """Show all available commands"""
     embed = discord.Embed(
-        title="🔇 SSL-Fixed Invisible Music & Attendance Bot Commands",
-        description="Your invisible all-in-one Discord bot with SSL-fixed music features and attendance tracking!\n\n**Bot is running in INVISIBLE mode** 👻\n**Music system is SSL-FIXED for cloud** ✅",
+        title="🔇 Invisible Attendance Bot Commands",
+        description="**Specialized for Voice Channel Attendance Tracking**\n\n"
+                   "Your bot is running in **INVISIBLE mode** 👻 and optimized for **attendance monitoring**!",
         color=0x0099ff
     )
     
-    # Music commands
+    # Attendance commands (fully functional)
     embed.add_field(
-        name="🎵 Music Commands (SSL-Fixed)",
-        value="`!play <song/url>` - Play music from YouTube or Spotify\n"
-              "`!skip` - Skip current song\n"
-              "`!stop` - Stop music and clear queue\n"
-              "`!queue [page]` - Show music queue\n"
-              "`!leave` - Disconnect from voice channel",
-        inline=False
-    )
-    
-    # Attendance commands
-    embed.add_field(
-        name="📊 Attendance & Status",
+        name="📊 Attendance Tracking (✅ Fully Functional)",
         value="`!attendance` - Show server attendance summary\n"
-              "`!attendance @user` - Show user attendance details\n"
-              "`!ping` - Check bot status\n"
-              "`!status` - Show bot mode and status\n"
-              "`!commands` - Show this help message",
+              "`!attendance @user` - Show detailed user attendance\n"
+              "`!export` - Export attendance data to CSV\n"
+              "`!stats` - Show detailed server statistics\n"
+              "`!clear_data` - Clear all attendance data (Admin only)",
         inline=False
     )
     
-    embed.set_footer(text="🔇 SSL-Fixed Invisible Music & Attendance Bot | Running on Cloud ☁️")
+    # Bot status commands
+    embed.add_field(
+        name="🤖 Bot Status & Info",
+        value="`!ping` - Check bot responsiveness\n"
+              "`!status` - Show bot capabilities\n"
+              "`!commands` - Show this help message\n"
+              "`!music_info` - Explain music limitations",
+        inline=False
+    )
+    
+    # Music commands (limited)
+    embed.add_field(
+        name="🎵 Music Commands (⚠️ Limited by Cloud)",
+        value="`!play <song>` - Explain music limitations\n"
+              "`!music_info` - Detailed music explanation\n\n"
+              "**Note:** Music is limited on free cloud hosting.\n"
+              "Attendance tracking works perfectly! 📊",
+        inline=False
+    )
+    
+    embed.set_footer(text="🔇 Invisible Attendance Bot | Optimized for Voice Channel Monitoring ☁️")
     await ctx.send(embed=embed)
 
 @bot.command(name='attendance')
@@ -932,7 +383,14 @@ async def show_attendance(ctx, user_mention=None):
         guild_id = str(ctx.guild.id)
         
         if guild_id not in attendance_data:
-            await ctx.send("No attendance data found for this server.")
+            embed = discord.Embed(
+                title="📊 Attendance Data",
+                description="No attendance data found for this server yet.\n\n"
+                           "**The bot will start tracking when users join voice channels!**",
+                color=0x808080
+            )
+            embed.set_footer(text="🔇 Invisible Attendance Bot | Voice Channel Monitoring ☁️")
+            await ctx.send(embed=embed)
             return
         
         if user_mention:
@@ -951,7 +409,7 @@ async def show_attendance(ctx, user_mention=None):
                     
                     # Add statistics
                     embed.add_field(
-                        name="📈 Statistics",
+                        name="📈 Session Statistics",
                         value=f"**Total Sessions:** {stats['total_sessions']}\n"
                               f"**Completed Sessions:** {stats['completed_sessions']}\n"
                               f"**Currently Active:** {stats['active_sessions']}\n"
@@ -961,7 +419,22 @@ async def show_attendance(ctx, user_mention=None):
                         inline=False
                     )
                     
-                    embed.set_footer(text=f"🔇 SSL-Fixed Invisible Music & Attendance Bot | Running on Cloud ☁️")
+                    # Show recent sessions
+                    if user_data['sessions']:
+                        recent_sessions = user_data['sessions'][-5:]  # Last 5 sessions
+                        session_text = ""
+                        for session in recent_sessions:
+                            join_time = format_timestamp(session['join_time'])
+                            duration = format_duration(session.get('duration', 'Ongoing'))
+                            session_text += f"**{session['channel_name']}**\n{join_time}\nDuration: {duration}\n\n"
+                        
+                        embed.add_field(
+                            name="🕒 Recent Sessions",
+                            value=session_text[:1024],  # Discord field limit
+                            inline=False
+                        )
+                    
+                    embed.set_footer(text="🔇 Invisible Attendance Bot | Voice Channel Monitoring ☁️")
                     await ctx.send(embed=embed)
                 else:
                     await ctx.send("❌ No attendance data found for this user.")
@@ -991,19 +464,102 @@ async def show_attendance(ctx, user_mention=None):
                 inline=False
             )
             
-            embed.set_footer(text=f"🔇 SSL-Fixed Invisible Music & Attendance Bot | Running on Cloud ☁️")
+            # Show most active users
+            user_stats = []
+            for user_id, user_data in attendance_data[guild_id].items():
+                stats = get_session_stats(user_data['sessions'])
+                user_stats.append({
+                    'name': user_data.get('display_name', user_data['username']),
+                    'sessions': stats['total_sessions'],
+                    'total_time': stats['total_time']
+                })
+            
+            # Sort by session count
+            user_stats.sort(key=lambda x: x['sessions'], reverse=True)
+            
+            if user_stats:
+                top_users = user_stats[:5]  # Top 5 users
+                top_users_text = ""
+                for i, user in enumerate(top_users, 1):
+                    top_users_text += f"{i}. **{user['name']}** - {user['sessions']} sessions ({user['total_time']})\n"
+                
+                embed.add_field(
+                    name="🏆 Most Active Users",
+                    value=top_users_text,
+                    inline=False
+                )
+            
+            embed.set_footer(text="🔇 Invisible Attendance Bot | Voice Channel Monitoring ☁️")
             await ctx.send(embed=embed)
             
     except Exception as e:
         logger.error(f"Error in attendance command: {e}")
         await ctx.send("❌ An error occurred while fetching attendance data.")
 
+@bot.command(name='export')
+async def export_attendance(ctx):
+    """Export attendance data to CSV format"""
+    try:
+        guild_id = str(ctx.guild.id)
+        
+        if guild_id not in attendance_data or not attendance_data[guild_id]:
+            await ctx.send("❌ No attendance data to export.")
+            return
+        
+        # Create CSV content
+        csv_content = "Username,Display Name,Channel,Join Time,Leave Time,Duration\n"
+        
+        for user_id, user_data in attendance_data[guild_id].items():
+            username = user_data['username']
+            display_name = user_data.get('display_name', username)
+            
+            for session in user_data['sessions']:
+                join_time = format_timestamp(session['join_time'])
+                leave_time = format_timestamp(session.get('leave_time', 'Ongoing'))
+                duration = format_duration(session.get('duration', 'Ongoing'))
+                channel = session['channel_name']
+                
+                csv_content += f'"{username}","{display_name}","{channel}","{join_time}","{leave_time}","{duration}"\n'
+        
+        # Save to file
+        filename = f"attendance_export_{ctx.guild.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(csv_content)
+        
+        # Send file
+        embed = discord.Embed(
+            title="📁 Attendance Data Export",
+            description=f"**Server:** {ctx.guild.name}\n"
+                       f"**Export Time:** {datetime.now().strftime('%B %d, %Y at %I:%M:%S %p')}\n"
+                       f"**Total Users:** {len(attendance_data[guild_id])}\n"
+                       f"**File Format:** CSV",
+            color=0x00ff00
+        )
+        embed.set_footer(text="🔇 Invisible Attendance Bot | Data Export ☁️")
+        
+        await ctx.send(embed=embed, file=discord.File(filename))
+        
+        # Clean up file
+        os.remove(filename)
+        
+    except Exception as e:
+        logger.error(f"Error exporting attendance data: {e}")
+        await ctx.send("❌ An error occurred while exporting data.")
+
 def get_session_stats(sessions):
     """Get statistics about user sessions"""
     if not sessions:
-        return {"total_sessions": 0, "total_time": "0s", "avg_session": "0s", "longest_session": "0s"}
+        return {
+            "total_sessions": 0, 
+            "completed_sessions": 0,
+            "active_sessions": 0,
+            "total_time": "0s", 
+            "avg_session": "0s", 
+            "longest_session": "0s"
+        }
     
     completed_sessions = [s for s in sessions if s.get('duration') and s['duration'] != "Ongoing"]
+    active_sessions = sum(1 for s in sessions if s.get('leave_time') is None)
     durations = []
     
     for session in completed_sessions:
@@ -1046,8 +602,6 @@ def get_session_stats(sessions):
             longest_session = f"{max_m}m {max_s}s"
         else:
             longest_session = f"{max_s}s"
-    
-    active_sessions = sum(1 for s in sessions if s.get('leave_time') is None)
     
     return {
         "total_sessions": len(sessions),
@@ -1102,9 +656,10 @@ if __name__ == "__main__":
         logger.error("Please set the DISCORD_BOT_TOKEN environment variable")
         exit(1)
     else:
-        logger.info("Starting SSL-FIXED Invisible Discord Music & Attendance Bot...")
+        logger.info("Starting Cloud-Compatible Invisible Discord Attendance Bot...")
+        logger.info("Bot optimized for voice channel attendance tracking")
+        logger.info("Music functionality disabled due to cloud platform restrictions")
         logger.info("Bot will run 24/7 on cloud infrastructure in INVISIBLE mode")
-        logger.info("SSL certificate verification disabled for cloud compatibility")
         try:
             bot.run(token)
         except Exception as e:
